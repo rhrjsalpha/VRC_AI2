@@ -1,0 +1,7 @@
+conda create -n vrc_ai311 python=3.11 -y
+conda activate vrc_ai311
+python -m pip install --upgrade pip setuptools wheel
+
+pip install --no-cache-dir nvidia-cudnn-cu12>=9.10
+
+pip install faster-whisper sounddevice numpy scipy
