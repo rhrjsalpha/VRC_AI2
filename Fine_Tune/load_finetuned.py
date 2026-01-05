@@ -164,7 +164,7 @@ def gen_chat(user_text: str, max_new_tokens=120):
 # ==============================
 # 8) 테스트
 # ==============================
-tests = ["안녕?", "한 문장으로 자기소개해줘.", "What is your name?", "네 이름이 루미 맞아?"]
+tests = ["너의 가장 친한 친구 이름은?"]
 
 for t in tests:
     start=time.time()
@@ -177,4 +177,3 @@ for t in tests:
         print("ERROR:", repr(e))
     end=time.time()
     print("TIME:", end-start)
-

@@ -2,7 +2,7 @@ import numpy as np
 import threading
 import sounddevice as sd
 from faster_whisper import WhisperModel
-import time
+import time, queue
 # ===== 마이크 선택 =====
 def find_input_device(keyword):
     """select mic device"""
@@ -23,10 +23,10 @@ def calibrate_noise(MIC_ID, SR, seconds=0.5):
     # 배경소음의 3~5배 정도를 임계값으로
     return max(0.003, noise * 3.0)
 
-def record_until_silence(MIC_ID, FRAME_MS, FRAME, START_SEC, END_SEC, MAX_SEC, SR):
+def record_until_silence(MIC_ID, FRAME_MS, FRAME, START_SEC, END_SEC, MAX_SEC, SR, utter_event=None):
     # RMS_TH = calibrate_noise(MIC_ID, SR)
     # print("Auto RMS_TH:", RMS_TH)
-    RMS_TH = 0.03
+    RMS_TH = 0.01
     START_FRAMES  = int(START_SEC * 1000 / FRAME_MS)
     END_FRAMES    = int(END_SEC   * 1000 / FRAME_MS)
     MAX_FRAMES    = int(MAX_SEC   * 1000 / FRAME_MS)
@@ -59,6 +59,8 @@ def record_until_silence(MIC_ID, FRAME_MS, FRAME, START_SEC, END_SEC, MAX_SEC, S
             voiced_run = voiced_run + 1 if is_voiced else 0
             if voiced_run >= START_FRAMES:
                 started = True
+                if utter_event is not None:
+                    utter_event.set()
                 recorded.extend(ring)
                 ring.clear()
                 silent_run = 0
@@ -87,52 +89,89 @@ def record_until_silence(MIC_ID, FRAME_MS, FRAME, START_SEC, END_SEC, MAX_SEC, S
         # 종료 신호가 오거나, 최악의 경우 timeout
         done.wait(timeout=MAX_SEC + 2.0)
 
+    if utter_event is not None:
+        utter_event.clear()  # 발화 캡처 종료(무음/timeout 포함)
+
     if not recorded:
         return None, "no_audio"
 
     audio = np.concatenate(recorded, axis=0).astype(np.float32)
     return audio, reason["v"] or "unknown"
 
-def SST_Wisper_Model(MIC_device_name, FRAME_MS, FRAME, START_SEC, END_SEC, MAX_SEC, SR):
+def recorder_thread(audio_q, MIC_ID, FRAME_MS, FRAME, START_SEC, END_SEC, MAX_SEC, SR, stop_event_recorder,  utter_event=None):
+    while not stop_event_recorder.is_set():
+        audio, reason = record_until_silence(MIC_ID, FRAME_MS, FRAME, START_SEC, END_SEC, MAX_SEC, SR, utter_event=utter_event)
+        if audio is None:
+            continue
+        audio_q.put((audio, reason))
+
+def stt_thread(audio_q, text_q, model, stop_event_sst, stt_busy_event=None):
+    while not stop_event_sst.is_set():
+        try:
+            audio, reason = audio_q.get(timeout=0.2)
+        except queue.Empty:
+            continue
+
+        if stt_busy_event is not None:
+            stt_busy_event.set()  # ✅ "지금 STT 중"
+
+        segments, info = model.transcribe(audio, language="ko", vad_filter=True)
+        text = " ".join(seg.text for seg in segments).strip()
+        if text:
+            text_q.put(text)
+
+        if stt_busy_event is not None:
+            stt_busy_event.clear()  # ✅ "STT 끝"
+
+def run_chain(MIC_device_name="INZONE"):
+    SR = 16000
+    FRAME_MS = 30
+    FRAME = int(SR * FRAME_MS / 1000)
+    START_SEC = 0.15
+    END_SEC = 0.60
+    MAX_SEC = 10.0
+
     MIC_ID = find_input_device(MIC_device_name)
     print("Using mic device:", MIC_ID)
 
-    rec_start = time.time()
-    audio, reason = record_until_silence(MIC_ID, FRAME_MS, FRAME, START_SEC, END_SEC, MAX_SEC, SR)  # ★ 언패킹
-    rec_end = time.time()
+    # ★ 핵심: 모델은 한 번만 로드 (가능하면 메인에서)
+    model = WhisperModel("small", device="cpu", compute_type="int8", cpu_threads=4, num_workers=1)
 
-    if audio is None or audio.size == 0:
-        print(f"No speech detected. reason={reason}, rec_total: {rec_end - rec_start:.4f}s")
-        return
+    audio_q = queue.Queue(maxsize=8)
+    text_q  = queue.Queue(maxsize=8)
+    stop_event_rec = threading.Event()
+    stop_event_sst = threading.Event()
 
-    print(f"Recorded {audio.size / SR:.2f}s, rec_total: {rec_end - rec_start:.4f}s, reason={reason}")
+    t_rec = threading.Thread(
+        target=recorder_thread,
+        args=(audio_q, MIC_ID, FRAME_MS, FRAME, START_SEC, END_SEC, MAX_SEC, SR, stop_event_rec),
+        daemon=False,
+    )
+    t_stt = threading.Thread(
+        target=stt_thread,
+        args=(audio_q, text_q, model, stop_event_sst),
+        daemon=False,
+    )
 
-    model_start = time.time()
-    model = model = WhisperModel(
-    "small",
-    device="cpu",
-    compute_type="int8",
-    cpu_threads=4,
-    num_workers=1,
-)
-    segments, info = model.transcribe(audio, language="ko", vad_filter=True)
-    model_end = time.time()
+    t_rec.start()
+    t_stt.start()
 
-    text = " ".join(seg.text for seg in segments).strip()
-    print("STT:", text, "time:", model_end - model_start)
-    return text
+    try:
+        while True:
+            print(audio_q.queue)
+            print(text_q.queue)
+            text = text_q.get()
+            print("STT:", text)
+            # 여기서 LLM 응답/tts로 이어가면 됨
+    except KeyboardInterrupt:
+        print("Stopping...")
+        stop_event_rec.set()
+        stop_event_sst.set()
+        t_rec.join()
+        t_stt.join()
 
-# ===== 실행 =====
 if __name__ == "__main__":
-    SR = 16000
-    # ---- VAD(무음 감지) 파라미터 ----
-    FRAME_MS = 30  # 프레임 길이(ms) 20~30 권장
-    FRAME = int(SR * FRAME_MS / 1000)
-    START_SEC = 0.15  # 이만큼 연속으로 소리나면 "말 시작"
-    END_SEC = 0.60  # 이만큼 연속 무음이면 "말 종료"
-    MAX_SEC = 10.0  # 최대 녹음 길이(안전장치)
-
-    SST_Wisper_Model("INZONE", FRAME_MS, FRAME, START_SEC, END_SEC, MAX_SEC, SR)
+    run_chain("INZONE")
 
 
 
